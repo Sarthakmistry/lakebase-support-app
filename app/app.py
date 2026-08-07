@@ -1,35 +1,50 @@
 import os
 import streamlit as st
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg_pool import ConnectionPool
+from databricks.sdk import WorkspaceClient
 
 st.set_page_config(page_title="Support Tickets", layout="wide")
 
+w = WorkspaceClient()
 
-# database connection
-def get_connection():
-    return psycopg2.connect(
-        host=os.environ["LAKEBASE_HOST"],
-        port=os.environ.get("LAKEBASE_PORT", "5432"),
-        dbname=os.environ["LAKEBASE_DB"],
-        user=os.environ["LAKEBASE_USER"],
-        password=os.environ["LAKEBASE_PASSWORD"],
-        sslmode="require",
+# Connection pool with automatic OAuth token rotation
+
+class OAuthConnection(psycopg.Connection):
+    @classmethod
+    def connect(cls, conninfo="", **kwargs):
+        endpoint_name = os.environ["ENDPOINT_NAME"]
+        credential = w.postgres.generate_database_credential(endpoint=endpoint_name)
+        kwargs["password"] = credential.token
+        return super().connect(conninfo, **kwargs)
+
+
+@st.cache_resource
+def get_pool():
+    username = os.environ["PGUSER"]
+    host = os.environ["PGHOST"]
+    port = os.environ.get("PGPORT", "5432")
+    database = os.environ["PGDATABASE"]
+    sslmode = os.environ.get("PGSSLMODE", "require")
+    return ConnectionPool(
+        conninfo=f"dbname={database} user={username} host={host} port={port} sslmode={sslmode}",
+        connection_class=OAuthConnection,
+        min_size=1,
+        max_size=10,
+        open=True,
     )
 
-
 def run_query(query, params=None, fetch=True):
-    conn = get_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
             cur.execute(query, params or ())
             if fetch:
-                return cur.fetchall()
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
             conn.commit()
-    finally:
-        conn.close()
 
-# Data access
+# --- Data access ----------------------------------------------------------
 
 def get_tickets():
     return run_query("SELECT * FROM tickets ORDER BY created_at DESC")
@@ -61,7 +76,7 @@ def update_status(ticket_id, status):
         fetch=False,
     )
 
-# UI 
+# --- UI --------------------------------------------------------------------
 
 st.title("Support Ticket System")
 
@@ -95,11 +110,11 @@ with tab_view:
         with col1:
             st.write(f"**Created by:** {ticket['created_by']}  |  **Created at:** {ticket['created_at']}")
         with col2:
+            statuses = ["open", "in_progress", "resolved"]
             new_status = st.selectbox(
                 "Status",
-                ["open", "in_progress", "resolved"],
-                index=["open", "in_progress", "resolved"].index(ticket["status"])
-                if ticket["status"] in ["open", "in_progress", "resolved"] else 0,
+                statuses,
+                index=statuses.index(ticket["status"]) if ticket["status"] in statuses else 0,
                 key=f"status_{ticket_id}",
             )
             if new_status != ticket["status"]:
